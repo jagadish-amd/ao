@@ -17,7 +17,10 @@ from utils import (
 )
 
 from torchao.prototype.mx_formats.mx_tensor import to_mx
-from torchao.prototype.mx_formats.utils import to_blocked
+from torchao.prototype.mx_formats.utils import (
+    rocm_mxfp4_ext_scale_layout_available,
+    to_blocked,
+)
 from torchao.testing.training.roofline_utils import get_specs
 from torchao.utils import is_MI300, is_ROCM, torch_version_at_least
 
@@ -138,8 +141,7 @@ def run(
                 scale_a = to_blocked(scale_a)
                 scale_b = to_blocked(scale_b)
         elif recipe == "mxfp4_cutlass":
-            # Use the blockwise scales from to_mx
-            if is_ROCM():
+            if is_ROCM() and not rocm_mxfp4_ext_scale_layout_available():
                 scale_a = A_scales
                 scale_b = B_scales
             else:
@@ -172,13 +174,25 @@ def run(
             swizzle = (
                 SwizzleType.NO_SWIZZLE if is_ROCM() else SwizzleType.SWIZZLE_32_4_4
             )
+            if is_ROCM() and rocm_mxfp4_ext_scale_layout_available():
+                ext = getattr(
+                    ScalingType, "BlockWiseBlk32Ue8m0_32_8_EXT", None
+                )
+                if ext is None:
+                    raise RuntimeError(
+                        "ROCm MXFP4 via F.scaled_mm requires PyTorch with "
+                        "ScalingType.BlockWiseBlk32Ue8m0_32_8_EXT (gfx950 EXT scales)."
+                    )
+                recipe_a = recipe_b = ext
+            else:
+                recipe_a = recipe_b = ScalingType.BlockWise1x32
             return F.scaled_mm(
                 A,
                 B,
                 scale_a=scale_a,
-                scale_recipe_a=ScalingType.BlockWise1x32,
+                scale_recipe_a=recipe_a,
                 scale_b=scale_b,
-                scale_recipe_b=ScalingType.BlockWise1x32,
+                scale_recipe_b=recipe_b,
                 swizzle_a=swizzle,
                 swizzle_b=swizzle,
                 output_dtype=dtype,

@@ -28,25 +28,65 @@ def ceil_div(a, b):
     return (a + b - 1) // b
 
 
+def _rocm_release_tuple() -> tuple[int, ...] | None:
+    r = getattr(torch.version, "rocm", None)
+    if r is None:
+        return None
+    try:
+        parts = [int(x) for x in str(r).split(".")[:3]]
+    except ValueError:
+        return None
+    while len(parts) < 3:
+        parts.append(0)
+    return (parts[0], parts[1], parts[2])
+
+
+def rocm_mxfp4_ext_scale_layout_available() -> bool:
+    """True when runtime ROCm is at least 7.13.0 (aligns with PyTorch EXT when ROCM_VERSION >= 71300)."""
+    t = _rocm_release_tuple()
+    return t is not None and t >= (7, 13, 0)
+
+
 def to_blocked(input_matrix, use_triton_kernel: bool = False) -> Tensor:
     """
-    Rearrange a large matrix by breaking it into blocks and applying the rearrangement pattern.
+    Rearrange MX block scale factors for GEMM consumption (device-specific layout).
 
-    See:
-        https://docs.nvidia.com/cuda/cublas/index.html#d-block-scaling-factors-layout
+    On CUDA, uses the cuBLAS MX block scaling layout (128x4 tiles); see
+    https://docs.nvidia.com/cuda/cublas/index.html#d-block-scaling-factors-layout
+
+    On ROCm 7.13.0 or newer (``torch.version.rocm``), uses the hipBLASLt GFX950 pre-swizzled E8M0
+    layout for ``Block_32_UE8M0_32_8_EXT``. On older ROCm, uses the same cuBLAS-style layout as CUDA.
 
     Args:
         input_matrix: Input tensor of shape (H, W)
         use_triton_kernel: Whether to use a triton implementation instead of relying on
-            torch.compile
+            torch.compile (CUDA only; on ROCm 7.13+ EXT layout is used instead)
 
     Returns:
-        Rearranged tensor of shape (32*ceil_div(H,128), 16*ceil_div(W,4))
+        1D contiguous tensor in the device-specific blocked layout.
     """
+    rows, cols = input_matrix.shape
+
+    if torch.version.hip and rocm_mxfp4_ext_scale_layout_available():
+        padded_rows = ceil_div(rows, 32) * 32
+        padded_cols = ceil_div(cols, 8) * 8
+
+        padded = input_matrix
+        if (rows, cols) != (padded_rows, padded_cols):
+            padded = torch.zeros(
+                (padded_rows, padded_cols),
+                device=input_matrix.device,
+                dtype=input_matrix.dtype,
+            )
+            padded[:rows, :cols] = input_matrix
+
+        x = padded.view(padded_rows // 32, 2, 16, padded_cols // 8, 2, 4)
+        x = x.permute(0, 3, 5, 2, 4, 1).contiguous()
+        return x.flatten()
+
     if use_triton_kernel:
         return triton_mx_block_rearrange(input_matrix).flatten()
 
-    rows, cols = input_matrix.shape
     n_row_blocks = ceil_div(rows, 128)
     n_col_blocks = ceil_div(cols, 4)
 
@@ -84,6 +124,21 @@ def from_blocked(
     Returns:
         Tensor of shape (original_rows, original_cols) in regular layout
     """
+    if torch.version.hip and rocm_mxfp4_ext_scale_layout_available():
+        padded_rows = ceil_div(original_rows, 32) * 32
+        padded_cols = ceil_div(original_cols, 8) * 8
+        r_blk = padded_rows // 32
+        c_blk = padded_cols // 8
+        expected_numel = padded_rows * padded_cols
+        if blocked_tensor.numel() != expected_numel:
+            raise ValueError(
+                f"ROCm from_blocked: expected {expected_numel} elements, got {blocked_tensor.numel()}"
+            )
+        y = blocked_tensor.reshape(r_blk, c_blk, 4, 16, 2, 2)
+        x = y.permute(0, 5, 3, 1, 4, 2).contiguous()
+        padded = x.reshape(padded_rows, padded_cols)
+        return padded[:original_rows, :original_cols]
+
     n_row_blocks = ceil_div(original_rows, 128)
     n_col_blocks = ceil_div(original_cols, 4)
 
