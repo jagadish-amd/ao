@@ -55,7 +55,7 @@ def to_blocked(input_matrix, use_triton_kernel: bool = False) -> Tensor:
     https://docs.nvidia.com/cuda/cublas/index.html#d-block-scaling-factors-layout
 
     On ROCm 7.13.0 or newer (``torch.version.rocm``), uses the hipBLASLt GFX950 pre-swizzled E8M0
-    layout for ``Block_32_UE8M0_32_8_EXT``. On older ROCm, uses the same cuBLAS-style layout as CUDA.
+    layout for ``Block_32_UE8M0_32_8_EXT``. On older ROCm, returns the input unchanged (contiguous 1D).
 
     Args:
         input_matrix: Input tensor of shape (H, W)
@@ -67,22 +67,24 @@ def to_blocked(input_matrix, use_triton_kernel: bool = False) -> Tensor:
     """
     rows, cols = input_matrix.shape
 
-    if torch.version.hip and rocm_mxfp4_ext_scale_layout_available():
-        padded_rows = ceil_div(rows, 32) * 32
-        padded_cols = ceil_div(cols, 8) * 8
+    if torch.version.hip:
+        if rocm_mxfp4_ext_scale_layout_available():
+            padded_rows = ceil_div(rows, 32) * 32
+            padded_cols = ceil_div(cols, 8) * 8
 
-        padded = input_matrix
-        if (rows, cols) != (padded_rows, padded_cols):
-            padded = torch.zeros(
-                (padded_rows, padded_cols),
-                device=input_matrix.device,
-                dtype=input_matrix.dtype,
-            )
-            padded[:rows, :cols] = input_matrix
+            padded = input_matrix
+            if (rows, cols) != (padded_rows, padded_cols):
+                padded = torch.zeros(
+                    (padded_rows, padded_cols),
+                    device=input_matrix.device,
+                    dtype=input_matrix.dtype,
+                )
+                padded[:rows, :cols] = input_matrix
 
-        x = padded.view(padded_rows // 32, 2, 16, padded_cols // 8, 2, 4)
-        x = x.permute(0, 3, 5, 2, 4, 1).contiguous()
-        return x.flatten()
+            x = padded.view(padded_rows // 32, 2, 16, padded_cols // 8, 2, 4)
+            x = x.permute(0, 3, 5, 2, 4, 1).contiguous()
+            return x.flatten()
+        return input_matrix.contiguous().flatten()
 
     if use_triton_kernel:
         return triton_mx_block_rearrange(input_matrix).flatten()
@@ -124,20 +126,22 @@ def from_blocked(
     Returns:
         Tensor of shape (original_rows, original_cols) in regular layout
     """
-    if torch.version.hip and rocm_mxfp4_ext_scale_layout_available():
-        padded_rows = ceil_div(original_rows, 32) * 32
-        padded_cols = ceil_div(original_cols, 8) * 8
-        r_blk = padded_rows // 32
-        c_blk = padded_cols // 8
-        expected_numel = padded_rows * padded_cols
-        if blocked_tensor.numel() != expected_numel:
-            raise ValueError(
-                f"ROCm from_blocked: expected {expected_numel} elements, got {blocked_tensor.numel()}"
-            )
-        y = blocked_tensor.reshape(r_blk, c_blk, 4, 16, 2, 2)
-        x = y.permute(0, 5, 3, 1, 4, 2).contiguous()
-        padded = x.reshape(padded_rows, padded_cols)
-        return padded[:original_rows, :original_cols]
+    if torch.version.hip:
+        if rocm_mxfp4_ext_scale_layout_available():
+            padded_rows = ceil_div(original_rows, 32) * 32
+            padded_cols = ceil_div(original_cols, 8) * 8
+            r_blk = padded_rows // 32
+            c_blk = padded_cols // 8
+            expected_numel = padded_rows * padded_cols
+            if blocked_tensor.numel() != expected_numel:
+                raise ValueError(
+                    f"ROCm from_blocked: expected {expected_numel} elements, got {blocked_tensor.numel()}"
+                )
+            y = blocked_tensor.reshape(r_blk, c_blk, 4, 16, 2, 2)
+            x = y.permute(0, 5, 3, 1, 4, 2).contiguous()
+            padded = x.reshape(padded_rows, padded_cols)
+            return padded[:original_rows, :original_cols]
+        return blocked_tensor.reshape(original_rows, original_cols)
 
     n_row_blocks = ceil_div(original_rows, 128)
     n_col_blocks = ceil_div(original_cols, 4)
