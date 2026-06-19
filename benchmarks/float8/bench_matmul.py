@@ -171,9 +171,6 @@ def run(
                 raise RuntimeError(
                     "MXFP4 matmul requires PyTorch 2.10.0 or later for F.scaled_mm support"
                 )
-            swizzle = (
-                SwizzleType.NO_SWIZZLE if is_ROCM() else SwizzleType.SWIZZLE_32_4_4
-            )
             if is_ROCM() and rocm_mxfp4_ext_scale_layout_available():
                 ext = getattr(
                     ScalingType, "BlockWiseBlk32Ue8m0_32_8_EXT", None
@@ -184,8 +181,13 @@ def run(
                         "ScalingType.BlockWiseBlk32Ue8m0_32_8_EXT (gfx950 EXT scales)."
                     )
                 recipe_a = recipe_b = ext
+                swizzle_a = swizzle_b = SwizzleType.SWIZZLE_32_4_4
+            elif is_ROCM():
+                recipe_a = recipe_b = ScalingType.BlockWise1x32
+                swizzle_a = swizzle_b = SwizzleType.NO_SWIZZLE
             else:
                 recipe_a = recipe_b = ScalingType.BlockWise1x32
+                swizzle_a = swizzle_b = SwizzleType.SWIZZLE_32_4_4
             return F.scaled_mm(
                 A,
                 B,
@@ -193,8 +195,8 @@ def run(
                 scale_recipe_a=recipe_a,
                 scale_b=scale_b,
                 scale_recipe_b=recipe_b,
-                swizzle_a=swizzle,
-                swizzle_b=swizzle,
+                swizzle_a=swizzle_a,
+                swizzle_b=swizzle_b,
                 output_dtype=dtype,
             )
 
