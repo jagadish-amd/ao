@@ -19,6 +19,7 @@ from utils import (
 from torchao.prototype.mx_formats.mx_tensor import to_mx
 from torchao.prototype.mx_formats.utils import (
     rocm_mxfp4_ext_scale_layout_available,
+    rocm_mxfp8_ext_scale_layout_available,
     to_blocked,
 )
 from torchao.testing.training.roofline_utils import get_specs
@@ -136,8 +137,7 @@ def run(
         elif recipe == "mxfp8_cublas":
             scale_a = torch.ones(M, K // 32, device=device, dtype=torch.float8_e8m0fnu)
             scale_b = torch.ones(N, K // 32, device=device, dtype=torch.float8_e8m0fnu)
-            if not is_ROCM():
-                # pad if needed
+            if not is_ROCM() or rocm_mxfp8_ext_scale_layout_available():
                 scale_a = to_blocked(scale_a)
                 scale_b = to_blocked(scale_b)
         elif recipe == "mxfp4_cutlass":
@@ -212,15 +212,29 @@ def run(
                 raise NotImplementedError(
                     "mxfp8_cublas bench_matmul only supports AMD/ROCm for now"
                 )
+            if rocm_mxfp8_ext_scale_layout_available():
+                ext = getattr(
+                    ScalingType, "BlockWiseBlk32Ue8m0_32_8_EXT", None
+                )
+                if ext is None:
+                    raise RuntimeError(
+                        "ROCm MXFP8 via F.scaled_mm requires PyTorch with "
+                        "ScalingType.BlockWiseBlk32Ue8m0_32_8_EXT (gfx950 EXT scales)."
+                    )
+                recipe_a = recipe_b = ext
+                swizzle_a = swizzle_b = SwizzleType.SWIZZLE_32_4_4
+            else:
+                recipe_a = recipe_b = ScalingType.BlockWise1x32
+                swizzle_a = swizzle_b = SwizzleType.NO_SWIZZLE
             return F.scaled_mm(
                 A,
                 B,
                 scale_a=scale_a,
-                scale_recipe_a=ScalingType.BlockWise1x32,
+                scale_recipe_a=recipe_a,
                 scale_b=scale_b,
-                scale_recipe_b=ScalingType.BlockWise1x32,
-                swizzle_a=SwizzleType.NO_SWIZZLE,
-                swizzle_b=SwizzleType.NO_SWIZZLE,
+                scale_recipe_b=recipe_b,
+                swizzle_a=swizzle_a,
+                swizzle_b=swizzle_b,
                 output_dtype=dtype,
             )
 

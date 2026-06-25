@@ -47,6 +47,12 @@ def rocm_mxfp4_ext_scale_layout_available() -> bool:
     return t is not None and t >= (7, 13, 0)
 
 
+def rocm_mxfp8_ext_scale_layout_available() -> bool:
+    """True when runtime ROCm is at least 7.14.0 (aligns with PyTorch EXT when ROCM_VERSION >= 71400)."""
+    t = _rocm_release_tuple()
+    return t is not None and t >= (7, 14, 0)
+
+
 def to_blocked(input_matrix, use_triton_kernel: bool = False) -> Tensor:
     """
     Rearrange MX block scale factors for GEMM consumption (device-specific layout).
