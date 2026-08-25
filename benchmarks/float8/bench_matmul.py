@@ -18,8 +18,7 @@ from utils import (
 
 from torchao.prototype.mx_formats.mx_tensor import to_mx
 from torchao.prototype.mx_formats.utils import (
-    rocm_mxfp4_ext_scale_layout_available,
-    rocm_mxfp8_ext_scale_layout_available,
+    rocm_mx_swizzle,
     to_blocked,
 )
 from torchao.testing.training.roofline_utils import get_specs
@@ -137,16 +136,11 @@ def run(
         elif recipe == "mxfp8_cublas":
             scale_a = torch.ones(M, K // 32, device=device, dtype=torch.float8_e8m0fnu)
             scale_b = torch.ones(N, K // 32, device=device, dtype=torch.float8_e8m0fnu)
-            if not is_ROCM() or rocm_mxfp8_ext_scale_layout_available():
-                scale_a = to_blocked(scale_a)
-                scale_b = to_blocked(scale_b)
+            scale_a = to_blocked(scale_a, elem_dtype=torch.float8_e4m3fn)
+            scale_b = to_blocked(scale_b, elem_dtype=torch.float8_e4m3fn)
         elif recipe == "mxfp4_cutlass":
-            if is_ROCM() and not rocm_mxfp4_ext_scale_layout_available():
-                scale_a = A_scales
-                scale_b = B_scales
-            else:
-                scale_a = to_blocked(A_scales)
-                scale_b = to_blocked(B_scales)
+            scale_a = to_blocked(A_scales, elem_dtype=torch.float4_e2m1fn_x2)
+            scale_b = to_blocked(B_scales, elem_dtype=torch.float4_e2m1fn_x2)
         elif recipe == "nvfp4":
             # Use the blockwise scales from nvfp4_quantize
             scale_a = A_scales.view(torch.float8_e4m3fn)
@@ -164,6 +158,13 @@ def run(
                 A, B, scale_a, scale_b, out_dtype=d3, use_fast_accum=fast_accum
             )
 
+        def mx_swizzle(elem_dtype):
+            if not is_ROCM():
+                return SwizzleType.SWIZZLE_32_4_4
+            if rocm_mx_swizzle(elem_dtype):
+                return SwizzleType.SWIZZLE_32_8
+            return SwizzleType.NO_SWIZZLE
+
         def do_matmul_mxfp4(A, B):
             nonlocal scale_a
             nonlocal scale_b
@@ -171,32 +172,16 @@ def run(
                 raise RuntimeError(
                     "MXFP4 matmul requires PyTorch 2.10.0 or later for F.scaled_mm support"
                 )
-            if is_ROCM() and rocm_mxfp4_ext_scale_layout_available():
-                ext = getattr(
-                    ScalingType, "BlockWiseBlk32Ue8m0_32_8_EXT", None
-                )
-                if ext is None:
-                    raise RuntimeError(
-                        "ROCm MXFP4 via F.scaled_mm requires PyTorch with "
-                        "ScalingType.BlockWiseBlk32Ue8m0_32_8_EXT (gfx950 EXT scales)."
-                    )
-                recipe_a = recipe_b = ext
-                swizzle_a = swizzle_b = SwizzleType.SWIZZLE_32_4_4
-            elif is_ROCM():
-                recipe_a = recipe_b = ScalingType.BlockWise1x32
-                swizzle_a = swizzle_b = SwizzleType.NO_SWIZZLE
-            else:
-                recipe_a = recipe_b = ScalingType.BlockWise1x32
-                swizzle_a = swizzle_b = SwizzleType.SWIZZLE_32_4_4
+            swizzle = mx_swizzle(torch.float4_e2m1fn_x2)
             return F.scaled_mm(
                 A,
                 B,
                 scale_a=scale_a,
-                scale_recipe_a=recipe_a,
+                scale_recipe_a=ScalingType.BlockWise1x32,
                 scale_b=scale_b,
-                scale_recipe_b=recipe_b,
-                swizzle_a=swizzle_a,
-                swizzle_b=swizzle_b,
+                scale_recipe_b=ScalingType.BlockWise1x32,
+                swizzle_a=swizzle,
+                swizzle_b=swizzle,
                 output_dtype=dtype,
             )
 
@@ -212,29 +197,16 @@ def run(
                 raise NotImplementedError(
                     "mxfp8_cublas bench_matmul only supports AMD/ROCm for now"
                 )
-            if rocm_mxfp8_ext_scale_layout_available():
-                ext = getattr(
-                    ScalingType, "BlockWiseBlk32Ue8m0_32_8_EXT", None
-                )
-                if ext is None:
-                    raise RuntimeError(
-                        "ROCm MXFP8 via F.scaled_mm requires PyTorch with "
-                        "ScalingType.BlockWiseBlk32Ue8m0_32_8_EXT (gfx950 EXT scales)."
-                    )
-                recipe_a = recipe_b = ext
-                swizzle_a = swizzle_b = SwizzleType.SWIZZLE_32_4_4
-            else:
-                recipe_a = recipe_b = ScalingType.BlockWise1x32
-                swizzle_a = swizzle_b = SwizzleType.NO_SWIZZLE
+            swizzle = mx_swizzle(torch.float8_e4m3fn)
             return F.scaled_mm(
                 A,
                 B,
                 scale_a=scale_a,
-                scale_recipe_a=recipe_a,
+                scale_recipe_a=ScalingType.BlockWise1x32,
                 scale_b=scale_b,
-                scale_recipe_b=recipe_b,
-                swizzle_a=swizzle_a,
-                swizzle_b=swizzle_b,
+                scale_recipe_b=ScalingType.BlockWise1x32,
+                swizzle_a=swizzle,
+                swizzle_b=swizzle,
                 output_dtype=dtype,
             )
 

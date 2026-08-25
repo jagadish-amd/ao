@@ -79,6 +79,7 @@ from torchao.prototype.mx_formats.utils import (
     _swizzle_aware_slice,
     from_blocked,
     hp_data_dims_to_swizzled_scale_dims_mx,
+    rocm_mx_swizzle,
     to_blocked,
 )
 from torchao.quantization.quantize_.common import (
@@ -832,21 +833,35 @@ def _addmm_mx_dispatch(
                     output_dtype=torch.bfloat16,
                 )
         else:
-            # MI350 path - do not swizzle, and add bias separately
+            # MI350 path - the scale layout is fixed by the ROCm version, and
+            # bias is added separately
             assert not a.is_swizzled_scales
             assert not b.is_swizzled_scales
+
+            if rocm_mx_swizzle(a.elem_dtype):
+                swizzle = SwizzleType.SWIZZLE_32_8
+                a_scale_block = to_blocked(
+                    a.scale.view(M, K // a.block_size), elem_dtype=a.elem_dtype
+                )
+                b_scale_block = to_blocked(
+                    b.scale.t().view(N, K // b.block_size), elem_dtype=b.elem_dtype
+                )
+            else:
+                swizzle = SwizzleType.NO_SWIZZLE
+                a_scale_block = a.scale
+                b_scale_block = b.scale.t()
 
             if a.elem_dtype == torch.float8_e4m3fn:
                 assert b.elem_dtype == torch.float8_e4m3fn
                 res = F.scaled_mm(
                     a.qdata,
                     b.qdata,
-                    scale_a=a.scale,
+                    scale_a=a_scale_block,
                     scale_recipe_a=ScalingType.BlockWise1x32,
-                    scale_b=b.scale.t(),
+                    scale_b=b_scale_block,
                     scale_recipe_b=ScalingType.BlockWise1x32,
-                    swizzle_a=SwizzleType.NO_SWIZZLE,
-                    swizzle_b=SwizzleType.NO_SWIZZLE,
+                    swizzle_a=swizzle,
+                    swizzle_b=swizzle,
                     bias=None,
                     output_dtype=torch.bfloat16,
                 )
@@ -865,12 +880,12 @@ def _addmm_mx_dispatch(
                 res = F.scaled_mm(
                     a.qdata.view(torch.float4_e2m1fn_x2),
                     b.qdata.view(torch.float4_e2m1fn_x2),
-                    scale_a=a.scale,
+                    scale_a=a_scale_block,
                     scale_recipe_a=ScalingType.BlockWise1x32,
-                    scale_b=b.scale.t(),
+                    scale_b=b_scale_block,
                     scale_recipe_b=ScalingType.BlockWise1x32,
-                    swizzle_a=SwizzleType.NO_SWIZZLE,
-                    swizzle_b=SwizzleType.NO_SWIZZLE,
+                    swizzle_a=swizzle,
+                    swizzle_b=swizzle,
                     bias=None,
                     output_dtype=torch.bfloat16,
                 )

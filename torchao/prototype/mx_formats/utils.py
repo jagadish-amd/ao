@@ -18,6 +18,7 @@ from torchao.prototype.mx_formats.kernels import (
     triton_to_mxfp8_dim1,
 )
 from torchao.quantization.quantize_.common import KernelPreference
+from torchao.utils import is_MI350
 
 Tensor = torch.Tensor
 
@@ -41,32 +42,34 @@ def _rocm_release_tuple() -> tuple[int, ...] | None:
     return (parts[0], parts[1], parts[2])
 
 
-def rocm_mxfp4_ext_scale_layout_available() -> bool:
-    """True when runtime ROCm is at least 7.13.0 (aligns with PyTorch EXT when ROCM_VERSION >= 71300)."""
+def rocm_mx_swizzle(elem_dtype) -> bool:
+    """Whether this device takes MX block scales for `elem_dtype` in the swizzled layout."""
+    if not is_MI350():
+        return False
     t = _rocm_release_tuple()
-    return t is not None and t >= (7, 13, 0)
+    min_version = (7, 13, 0) if elem_dtype == torch.float4_e2m1fn_x2 else (7, 14, 0)
+    return t is not None and t >= min_version
 
 
-def rocm_mxfp8_ext_scale_layout_available() -> bool:
-    """True when runtime ROCm is at least 7.14.0 (aligns with PyTorch EXT when ROCM_VERSION >= 71400)."""
-    t = _rocm_release_tuple()
-    return t is not None and t >= (7, 14, 0)
-
-
-def to_blocked(input_matrix, use_triton_kernel: bool = False) -> Tensor:
+def to_blocked(
+    input_matrix, use_triton_kernel: bool = False, elem_dtype=None
+) -> Tensor:
     """
     Rearrange MX block scale factors for GEMM consumption (device-specific layout).
 
     On CUDA, uses the cuBLAS MX block scaling layout (128x4 tiles); see
     https://docs.nvidia.com/cuda/cublas/index.html#d-block-scaling-factors-layout
 
-    On ROCm 7.13.0 or newer (``torch.version.rocm``), uses the hipBLASLt GFX950 pre-swizzled E8M0
-    layout for ``Block_32_UE8M0_32_8_EXT``. On older ROCm, returns the input unchanged (contiguous 1D).
+    gfx950 tiles 32x8 instead, the layout hipBLASLt calls BLK32_UE8M0_32_8 and
+    torch names SwizzleType.SWIZZLE_32_8. MX FP4 takes it from ROCm 7.13 and MX
+    FP8 from 7.14, so callers on ROCm must pass elem_dtype, the dtype of the data
+    these scales belong to. Every other ROCm target takes the scales unswizzled.
 
     Args:
         input_matrix: Input tensor of shape (H, W)
         use_triton_kernel: Whether to use a triton implementation instead of relying on
-            torch.compile (CUDA only; on ROCm 7.13+ EXT layout is used instead)
+            torch.compile (CUDA only)
+        elem_dtype: dtype of the data `input_matrix` holds the scales for
 
     Returns:
         1D contiguous tensor in the device-specific blocked layout.
@@ -74,7 +77,7 @@ def to_blocked(input_matrix, use_triton_kernel: bool = False) -> Tensor:
     rows, cols = input_matrix.shape
 
     if torch.version.hip:
-        if rocm_mxfp4_ext_scale_layout_available():
+        if elem_dtype is not None and rocm_mx_swizzle(elem_dtype):
             padded_rows = ceil_div(rows, 32) * 32
             padded_cols = ceil_div(cols, 8) * 8
 
@@ -119,7 +122,7 @@ def to_blocked(input_matrix, use_triton_kernel: bool = False) -> Tensor:
 
 
 def from_blocked(
-    blocked_tensor: Tensor, original_rows: int, original_cols: int
+    blocked_tensor: Tensor, original_rows: int, original_cols: int, elem_dtype=None
 ) -> Tensor:
     """
     Inverse of to_blocked: convert from blocked layout back to regular row-major layout.
@@ -128,12 +131,13 @@ def from_blocked(
         blocked_tensor: Flattened blocked tensor from to_blocked()
         original_rows: Original number of rows before blocking
         original_cols: Original number of columns before blocking
+        elem_dtype: dtype of the data these scales belong to, see to_blocked
 
     Returns:
         Tensor of shape (original_rows, original_cols) in regular layout
     """
     if torch.version.hip:
-        if rocm_mxfp4_ext_scale_layout_available():
+        if elem_dtype is not None and rocm_mx_swizzle(elem_dtype):
             padded_rows = ceil_div(original_rows, 32) * 32
             padded_cols = ceil_div(original_cols, 8) * 8
             r_blk = padded_rows // 32

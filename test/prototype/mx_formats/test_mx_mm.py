@@ -11,7 +11,7 @@ import torch.nn.functional as F
 
 from torchao.float8.float8_utils import compute_error
 from torchao.prototype.mx_formats.mx_tensor import MXTensor
-from torchao.prototype.mx_formats.utils import to_blocked
+from torchao.prototype.mx_formats.utils import rocm_mx_swizzle, to_blocked
 from torchao.utils import (
     is_MI350,
     is_sm_at_least_100,
@@ -45,12 +45,20 @@ def _mxfp4_scaled_mm(a_data, b_data, a_scale_block, b_scale_block):
     )
 
 
+def _rocm_swizzle(elem_dtype):
+    """The scale layout gfx950 takes for elem_dtype, fixed by the ROCm version."""
+    if rocm_mx_swizzle(elem_dtype):
+        return SwizzleType.SWIZZLE_32_8
+    return SwizzleType.NO_SWIZZLE
+
+
 def _mxfp4_scaled_mm_rocm(a_data, b_data, a_scale_block, b_scale_block):
     """Wrapper for F.scaled_mm with MXFP4 configuration on ROCm."""
     if not torch_version_at_least("2.10.0"):
         raise RuntimeError(
             "MXFP4 matmul requires PyTorch 2.10.0 or later for F.scaled_mm support"
         )
+    swizzle = _rocm_swizzle(torch.float4_e2m1fn_x2)
     return F.scaled_mm(
         a_data.view(torch.float4_e2m1fn_x2),
         b_data.view(torch.float4_e2m1fn_x2),
@@ -58,8 +66,8 @@ def _mxfp4_scaled_mm_rocm(a_data, b_data, a_scale_block, b_scale_block):
         scale_recipe_a=ScalingType.BlockWise1x32,
         scale_b=b_scale_block,
         scale_recipe_b=ScalingType.BlockWise1x32,
-        swizzle_a=SwizzleType.NO_SWIZZLE,
-        swizzle_b=SwizzleType.NO_SWIZZLE,
+        swizzle_a=swizzle,
+        swizzle_b=swizzle,
         output_dtype=torch.bfloat16,
     )
 
@@ -70,6 +78,7 @@ def _mxfp8_scaled_mm_rocm(a_data, b_data, a_scale_block, b_scale_block):
         raise RuntimeError(
             "MXFP8 matmul requires PyTorch 2.10.0 or later for F.scaled_mm support"
         )
+    swizzle = _rocm_swizzle(torch.float8_e4m3fn)
     return F.scaled_mm(
         a_data,
         b_data,
@@ -77,8 +86,8 @@ def _mxfp8_scaled_mm_rocm(a_data, b_data, a_scale_block, b_scale_block):
         scale_recipe_a=ScalingType.BlockWise1x32,
         scale_b=b_scale_block,
         scale_recipe_b=ScalingType.BlockWise1x32,
-        swizzle_a=SwizzleType.NO_SWIZZLE,
-        swizzle_b=SwizzleType.NO_SWIZZLE,
+        swizzle_a=swizzle,
+        swizzle_b=swizzle,
         output_dtype=torch.bfloat16,
     )
 
@@ -116,13 +125,8 @@ def run_matrix_test(M: int, K: int, N: int, format) -> float:
     a_scale = a_mx.scale.view(M, K // 32)
     b_scale = b_mx.scale.view(N, K // 32)
 
-    if is_MI350():
-        # no swizzling on ROCm
-        a_scale_block = a_scale
-        b_scale_block = b_scale
-    else:
-        a_scale_block = to_blocked(a_scale)
-        b_scale_block = to_blocked(b_scale)
+    a_scale_block = to_blocked(a_scale, elem_dtype=fmt)
+    b_scale_block = to_blocked(b_scale, elem_dtype=fmt)
 
     out_hp = a_mx.dequantize(torch.bfloat16) @ b_mx.dequantize(
         torch.bfloat16
